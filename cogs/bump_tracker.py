@@ -6,6 +6,7 @@ from discord.ui import View, Button, Select
 import aiosqlite
 import datetime
 import asyncio
+import collections
 from typing import List, Dict, Optional
 import json
 from database import get_db
@@ -168,7 +169,12 @@ class BumpTracker(commands.Cog):
         self._last_bump_inactivity_notified_level = 0  # Bildirilen son uyarı seviyesi (0=yok, 4=4 saat, 12=12 saat @everyone)
         self.BUMP_WARN_HOURS = 4  # Bu kadar saat bump atılmazsa uyarı
         self.BUMP_WARN_EVERYONE_HOURS = 12  # Bu kadar saat bump atılmazsa @everyone ile uyarı
-    
+        # Aynı DISBOARD mesajının birden fazla kez sayılmasını engellemek için işlenmiş
+        # mesaj ID'leri. Bir mesaj hem on_message, hem on_raw_message_edit, hem de
+        # reconcile_missed_bumps tarafından görülebildiği için bu kontrol şarttır.
+        self._processed_bump_message_ids = set()
+        self._processed_bump_message_order = collections.deque()
+
     async def cog_load(self):
         self.db = await get_db()
         await self.create_tables()
@@ -266,6 +272,24 @@ class BumpTracker(commands.Cog):
             return message.interaction.user
         return None
 
+    def _claim_bump_message(self, message_id: int) -> bool:
+        """Mesajı 'işlendi' olarak işaretler. Daha önce işlendiyse False döner.
+        İçinde await olmadığı için asyncio altında atomiktir; böylece aynı mesaj
+        on_message / on_raw_message_edit / reconcile tarafından iki kez sayılmaz."""
+        if message_id in self._processed_bump_message_ids:
+            return False
+        self._processed_bump_message_ids.add(message_id)
+        self._processed_bump_message_order.append(message_id)
+        if len(self._processed_bump_message_order) > 500:
+            old = self._processed_bump_message_order.popleft()
+            self._processed_bump_message_ids.discard(old)
+        return True
+
+    def _release_bump_message(self, message_id: int):
+        """Kayıt başarısız olursa mesajın ileride (reconcile ile) tekrar denenebilmesi için
+        işaretini kaldırır."""
+        self._processed_bump_message_ids.discard(message_id)
+
     async def _register_bump(self, guild: discord.Guild, member: discord.Member, bump_time,
                               announce_channel: Optional[discord.abc.Messageable] = None):
         """Bump kaydını veritabanına işler; announce_channel verilirse bilgilendirme
@@ -346,7 +370,13 @@ class BumpTracker(commands.Cog):
                     except Exception:
                         continue
 
-                await self._register_bump(guild, member, message.created_at, announce_channel=None)
+                if not self._claim_bump_message(message.id):
+                    continue
+                try:
+                    await self._register_bump(guild, member, message.created_at, announce_channel=None)
+                except Exception:
+                    self._release_bump_message(message.id)
+                    raise
                 recovered += 1
         except Exception as e:
             print(f"[BumpTracker] Geçmiş bump taraması hatası: {e}")
@@ -363,6 +393,29 @@ class BumpTracker(commands.Cog):
         if message.author.id != self.DISBOARD_BOT_ID:
             return
         if message.channel.id != self.BUMP_CHANNEL_ID:
+            return
+
+        await self._process_disboard_message(message)
+
+    @commands.Cog.listener()
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
+        """DISBOARD /bump yanıtını yavaş kaldığında 'defer' eder: önce boş bir
+        "DISBOARD düşünüyor..." mesajı oluşturur (on_message bunu görür ama içinde embed
+        yoktur), ardından aynı mesajı başarı embed'iyle DÜZENLER. Bu düzenleme yalnızca
+        bu event ile yakalanabilir; dinlenmezse bu tür bump'lar hiç sayılmaz.
+        Raw event kullanılır çünkü mesaj bot cache'inde olmayabilir."""
+        if payload.channel_id != self.BUMP_CHANNEL_ID:
+            return
+        message = payload.message
+        if message is None or message.author.id != self.DISBOARD_BOT_ID:
+            return
+
+        await self._process_disboard_message(message)
+
+    async def _process_disboard_message(self, message: discord.Message):
+        """Bump kanalındaki bir DISBOARD mesajını (yeni veya düzenlenmiş) işler."""
+        # Defer edilmiş (henüz yüklenen) yanıt: içerik daha gelmedi, düzenleme beklenir.
+        if message.flags.loading:
             return
 
         classification = self._classify_bump_message(message)
@@ -399,10 +452,15 @@ class BumpTracker(commands.Cog):
         # kayıt oluşturulur. Aksi halde üye rolündeki biri bump attığında kayıt düşmez ve
         # bump_inactivity_task "4 saattir bump yok" uyarısını yanlışlıkla tetikler.
 
+        # Aynı mesaj daha önce (on_message / edit / reconcile ile) sayıldıysa tekrar sayma
+        if not self._claim_bump_message(message.id):
+            return
+
         # Bump kaydını oluştur
         try:
             await self._register_bump(guild, member, message.created_at, announce_channel=message.channel)
         except Exception as e:
+            self._release_bump_message(message.id)
             print(f"Otomatik bump kaydetme hatası: {e}")
 
     @app_commands.command(
